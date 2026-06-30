@@ -1,5 +1,7 @@
 import { createWalletClient, createPublicClient, http, defineChain } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 const ritualChain = defineChain({
   id: 1979,
@@ -7,6 +9,11 @@ const ritualChain = defineChain({
   nativeCurrency: { name: "RITUAL", symbol: "RITUAL", decimals: 18 },
   rpcUrls: { default: { http: ["https://rpc.ritualfoundation.org"] } },
 });
+
+function loadArtifact(name: string) {
+  const raw = readFileSync(join(process.cwd(), "artifacts", "contracts", name), "utf-8");
+  return JSON.parse(raw);
+}
 
 async function main() {
   const pk = process.env.DEPLOYER_PRIVATE_KEY;
@@ -20,11 +27,12 @@ async function main() {
   const balance = await publicClient.getBalance({ address: account.address });
   console.log(`💰 Balance: ${Number(balance) / 1e18} RITUAL\n`);
 
+  const ritualWalletAddr = "0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948" as const;
+
   // Deploy AIJudge
   console.log("📦 Deploying AIJudge...");
-  const aiJudgeArtifact = require("../artifacts/contracts/AIJudge.sol/AIJudge.json");
-  const ritualWalletAddr = "0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948";
-  
+  const aiJudgeArtifact = loadArtifact("AIJudge.sol/AIJudge.json");
+
   const aiJudgeHash = await client.deployContract({
     abi: aiJudgeArtifact.abi,
     bytecode: aiJudgeArtifact.bytecode as `0x${string}`,
@@ -36,8 +44,8 @@ async function main() {
 
   // Deploy PrivacyBountyJudge
   console.log("📦 Deploying PrivacyBountyJudge...");
-  const privacyArtifact = require("../artifacts/contracts/PrivacyBountyJudge.sol/PrivacyBountyJudge.json");
-  
+  const privacyArtifact = loadArtifact("PrivacyBountyJudge.sol/PrivacyBountyJudge.json");
+
   const privacyHash = await client.deployContract({
     abi: privacyArtifact.abi,
     bytecode: privacyArtifact.bytecode as `0x${string}`,
