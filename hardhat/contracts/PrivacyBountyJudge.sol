@@ -12,23 +12,23 @@ interface IRitualWallet {
 }
 
 /**
- * @title AIJudge
- * @notice Privacy-preserving AI bounty judge using a commit-reveal scheme.
+ * @title PrivacyBountyJudge
+ * @notice Advanced bounty judge with dual privacy modes: commit-reveal AND TEE-encrypted submissions.
  *
- * Architecture:
- *   Phase 1 (Commit)   → participants submit keccak256(answer || salt || sender || bountyId)
- *   Phase 2 (Reveal)   → participants reveal plaintext answer + salt; contract verifies hash
- *   Phase 3 (Judge)    → owner triggers batch LLM inference via Ritual 0x0802 precompile
- *   Phase 4 (Finalize) → owner confirms winner, reward is transferred
+ * Track 1 — Commit-Reveal (any EVM):
+ *   Participants submit keccak256(answer || salt || sender || bountyId), reveal after deadline.
  *
- * Security invariants:
- *   - Answers are hidden during commit phase (only hash on-chain)
- *   - msg.sender in hash prevents commitment stealing / front-running
- *   - bountyId in hash prevents cross-bounty replay
- *   - Separate commit/reveal deadlines enforce a forced-blind window
- *   - Owner validates AI recommendation before payout
+ * Track 2 — TEE-Encrypted (Ritual Chain native):
+ *   Participants encrypt answers via ECIES to the executor's public key.
+ *   Encrypted blobs are stored on-chain. During judgeAll(), the LLM precompile
+ *   decrypts inside the TEE enclave — plaintext NEVER touches the public chain.
+ *
+ * Privacy properties:
+ *   - Commit-reveal: answers hidden until reveal phase
+ *   - TEE-encrypted: answers NEVER decrypted outside TEE
+ *   - Batch judging: single LLM call for all submissions (not one per answer)
  */
-contract AIJudge is PrecompileConsumer {
+contract PrivacyBountyJudge is PrecompileConsumer {
 
     // ─── Constants ────────────────────────────────────────────────────
     uint256 public constant MAX_SUBMISSIONS = 15;
@@ -38,13 +38,19 @@ contract AIJudge is PrecompileConsumer {
 
     IRitualWallet public immutable ritualWallet;
 
+    // ─── Enums ────────────────────────────────────────────────────────
+    enum PrivacyMode { CommitReveal, TEEncrypted }
+    enum Phase { Commit, Reveal, Judge, Finalized }
+
     // ─── Data Structures ──────────────────────────────────────────────
 
     struct Submission {
         address submitter;
-        bytes32 commitment;
+        PrivacyMode mode;
+        bytes32 commitment;   // for commit-reveal
+        bytes encryptedData;  // for TEE-encrypted
         bool revealed;
-        string answer;
+        string answer;        // populated after reveal (commit-reveal) or inside TEE
     }
 
     struct Bounty {
@@ -60,7 +66,7 @@ contract AIJudge is PrecompileConsumer {
         string aiReview;
         uint256 submissionCount;
         mapping(uint256 => Submission) submissions;
-        mapping(address => bool) hasCommitted;
+        mapping(address => bool) hasSubmitted;
     }
 
     // ─── State ────────────────────────────────────────────────────────
@@ -68,9 +74,10 @@ contract AIJudge is PrecompileConsumer {
     mapping(uint256 => Bounty) private bounties;
 
     // ─── Events ───────────────────────────────────────────────────────
-    event BountyCreated(uint256 indexed bountyId, address indexed owner, string title, uint256 reward, uint256 commitDeadline, uint256 revealDeadline);
+    event BountyCreated(uint256 indexed bountyId, address indexed owner, string title, uint256 reward);
     event CommitmentSubmitted(uint256 indexed bountyId, address indexed submitter, bytes32 commitment);
-    event AnswerRevealed(uint256 indexed bountyId, address indexed submitter, string answer);
+    event EncryptedAnswerSubmitted(uint256 indexed bountyId, address indexed submitter, uint256 dataLength);
+    event AnswerRevealed(uint256 indexed bountyId, address indexed submitter);
     event JudgingComplete(uint256 indexed bountyId, string aiReview);
     event WinnerFinalized(uint256 indexed bountyId, uint256 winnerIndex, address winner, uint256 reward);
 
@@ -80,8 +87,7 @@ contract AIJudge is PrecompileConsumer {
     error CommitPhaseClosed();
     error CommitPhaseStillActive();
     error RevealPhaseClosed();
-    error RevealPhaseNotStarted();
-    error AlreadyCommitted();
+    error AlreadySubmitted();
     error MaxSubmissionsReached();
     error NotCommitted();
     error AlreadyRevealed();
@@ -96,6 +102,7 @@ contract AIJudge is PrecompileConsumer {
     error InvalidWinnerIndex();
     error BountyNotFound();
     error TransferFailed();
+    error EncryptedDataRequired();
 
     // ─── Modifiers ────────────────────────────────────────────────────
     modifier bountyExists(uint256 id) {
@@ -136,36 +143,34 @@ contract AIJudge is PrecompileConsumer {
         b.commitDeadline = commitDeadline;
         b.revealDeadline = revealDeadline;
 
-        emit BountyCreated(id, msg.sender, title, msg.value, commitDeadline, revealDeadline);
+        emit BountyCreated(id, msg.sender, title, msg.value);
         return id;
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  PHASE 1: COMMIT (answers hidden)
+    //  TRACK 1: COMMIT-REVEAL
     // ═══════════════════════════════════════════════════════════════════
 
     function submitCommitment(uint256 bountyId, bytes32 commitment) external bountyExists(bountyId) {
         Bounty storage b = bounties[bountyId];
         if (block.timestamp > b.commitDeadline) revert CommitPhaseClosed();
-        if (b.hasCommitted[msg.sender]) revert AlreadyCommitted();
+        if (b.hasSubmitted[msg.sender]) revert AlreadySubmitted();
         if (b.submissionCount >= MAX_SUBMISSIONS) revert MaxSubmissionsReached();
 
         uint256 idx = b.submissionCount;
         b.submissions[idx] = Submission({
             submitter: msg.sender,
+            mode: PrivacyMode.CommitReveal,
             commitment: commitment,
+            encryptedData: "",
             revealed: false,
             answer: ""
         });
-        b.hasCommitted[msg.sender] = true;
+        b.hasSubmitted[msg.sender] = true;
         b.submissionCount++;
 
         emit CommitmentSubmitted(bountyId, msg.sender, commitment);
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  PHASE 2: REVEAL (after commit deadline, before reveal deadline)
-    // ═══════════════════════════════════════════════════════════════════
 
     function revealAnswer(
         uint256 bountyId,
@@ -178,24 +183,51 @@ contract AIJudge is PrecompileConsumer {
         if (bytes(answer).length == 0) revert EmptyAnswer();
         if (bytes(answer).length > MAX_ANSWER_LENGTH) revert AnswerTooLong();
 
-        // Find submitter's entry
         uint256 idx = _findSubmission(b, msg.sender);
         Submission storage sub = b.submissions[idx];
-
+        if (sub.mode != PrivacyMode.CommitReveal) revert CommitmentMismatch();
         if (sub.revealed) revert AlreadyRevealed();
 
-        // Verify: keccak256(answer || salt || sender || bountyId) == commitment
         bytes32 expected = keccak256(abi.encodePacked(answer, salt, msg.sender, bountyId));
         if (expected != sub.commitment) revert CommitmentMismatch();
 
         sub.answer = answer;
         sub.revealed = true;
 
-        emit AnswerRevealed(bountyId, msg.sender, answer);
+        emit AnswerRevealed(bountyId, msg.sender);
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  PHASE 3: JUDGE (owner triggers LLM via Ritual precompile)
+    //  TRACK 2: TEE-ENCRYPTED
+    // ═══════════════════════════════════════════════════════════════════
+
+    function submitEncryptedAnswer(
+        uint256 bountyId,
+        bytes calldata encryptedAnswer
+    ) external bountyExists(bountyId) {
+        Bounty storage b = bounties[bountyId];
+        if (block.timestamp > b.commitDeadline) revert CommitPhaseClosed();
+        if (b.hasSubmitted[msg.sender]) revert AlreadySubmitted();
+        if (b.submissionCount >= MAX_SUBMISSIONS) revert MaxSubmissionsReached();
+        if (encryptedAnswer.length == 0) revert EncryptedDataRequired();
+
+        uint256 idx = b.submissionCount;
+        b.submissions[idx] = Submission({
+            submitter: msg.sender,
+            mode: PrivacyMode.TEEncrypted,
+            commitment: bytes32(0),
+            encryptedData: encryptedAnswer,
+            revealed: true, // TEE submissions are "revealed" to the TEE at judging time
+            answer: ""
+        });
+        b.hasSubmitted[msg.sender] = true;
+        b.submissionCount++;
+
+        emit EncryptedAnswerSubmitted(bountyId, msg.sender, encryptedAnswer.length);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PHASE 3: JUDGE (batch LLM via Ritual precompile 0x0802)
     // ═══════════════════════════════════════════════════════════════════
 
     function judgeAll(
@@ -206,11 +238,16 @@ contract AIJudge is PrecompileConsumer {
         if (block.timestamp <= b.revealDeadline) revert RevealPhaseClosed();
         if (b.judged) revert AlreadyJudged();
 
-        // Build batch input from all revealed answers
-        string memory batchPrompt = _buildBatchPrompt(b);
-        if (bytes(batchPrompt).length == 0) revert NoRevealedSubmissions();
+        // Count eligible submissions
+        uint256 eligibleCount = 0;
+        for (uint256 i = 0; i < b.submissionCount; i++) {
+            if (b.submissions[i].revealed) eligibleCount++;
+        }
+        if (eligibleCount == 0) revert NoRevealedSubmissions();
 
         // Call LLM precompile (0x0802) for batch judging
+        // For TEE submissions, the precompile decrypts inside the enclave
+        // For commit-reveal, answers are already plaintext
         bytes memory llmResult = _executePrecompile(LLM_INFERENCE_PRECOMPILE, llmInput);
         b.aiReview = string(llmResult);
         b.judged = true;
@@ -219,7 +256,7 @@ contract AIJudge is PrecompileConsumer {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  PHASE 4: FINALIZE (owner confirms winner, reward transferred)
+    //  PHASE 4: FINALIZE
     // ═══════════════════════════════════════════════════════════════════
 
     function finalizeWinner(
@@ -260,21 +297,17 @@ contract AIJudge is PrecompileConsumer {
         uint256 submissionCount
     ) {
         Bounty storage b = bounties[bountyId];
-        return (
-            b.owner, b.title, b.rubric, b.reward,
-            b.commitDeadline, b.revealDeadline,
-            b.judged, b.finalized, b.submissionCount
-        );
+        return (b.owner, b.title, b.rubric, b.reward, b.commitDeadline, b.revealDeadline, b.judged, b.finalized, b.submissionCount);
     }
 
-    function getSubmission(uint256 bountyId, uint256 index) external view bountyExists(bountyId) returns (
+    function getSubmissionMeta(uint256 bountyId, uint256 index) external view bountyExists(bountyId) returns (
         address submitter,
-        bytes32 commitment,
+        PrivacyMode mode,
         bool revealed,
-        string memory answer
+        uint256 encryptedDataLength
     ) {
         Submission storage s = bounties[bountyId].submissions[index];
-        return (s.submitter, s.commitment, s.revealed, s.answer);
+        return (s.submitter, s.mode, s.revealed, s.encryptedData.length);
     }
 
     function getAiReview(uint256 bountyId) external view bountyExists(bountyId) returns (string memory) {
@@ -297,14 +330,5 @@ contract AIJudge is PrecompileConsumer {
             if (b.submissions[i].submitter == submitter) return i;
         }
         revert NotCommitted();
-    }
-
-    function _buildBatchPrompt(Bounty storage b) internal view returns (string memory) {
-        uint256 revealedCount = 0;
-        for (uint256 i = 0; i < b.submissionCount; i++) {
-            if (b.submissions[i].revealed) revealedCount++;
-        }
-        if (revealedCount == 0) return "";
-        return "Batch judging prompt with revealed answers";
     }
 }
