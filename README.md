@@ -125,8 +125,6 @@ Answers encrypted via ECIES to executor's public key. Decrypted ONLY inside the 
 | **AIJudge** | `0x288564e14b4df3c383c13ec2616cef0d0b0fff82` | `0x9fef0156b718bc6f5494f6710afe1b9bb830e7a8c1aa17bb3f4a646e2a709ce6` |
 | **PrivacyBountyJudge** | `0x98a4e675232b2823c9e30e8b8c6c5b617d66f978` | `0x301ad1f6ae782db2936a5ab3f35680b2ce20df45db8120099e74550edd755361` |
 
-**Explorer:** https://ritual-scan.xyz/address/0x288564e14b4df3c383c13ec2616cef0d0b0fff82
-
 ---
 
 ## 📜 Smart Contracts
